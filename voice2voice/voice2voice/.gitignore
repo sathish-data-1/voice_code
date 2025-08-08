@@ -1,0 +1,22 @@
+Setup and Running Instructions
+Install dependencies:
+
+bash
+pip install -r requirements.txt
+Prepare your dataset:
+
+Place audio files in data/raw/
+
+Create train/val/test splits in data/splits/
+
+Run training:
+
+
+python scripts/train.py --config configs/base_config.yaml
+
+Run inference:
+
+
+python scripts/inference.py --config configs/base_config.yaml --model best_model.pth --input test.wav --output output.wav
+
+This complete implementation provides all the necessary components for your voice-to-voice system, from data processing to model training and real-time inference.
