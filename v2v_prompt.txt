@@ -1,0 +1,21 @@
+I want to build a direct speech-to-speech deep learning model that takes raw audio input and generates corresponding spoken audio output without converting audio to text at any stage. Please provide me a comprehensive, step-by-step guide covering:
+
+How to collect and prepare large-scale raw voice datasets, including paired input-output voice samples for supervised fine-tuning.
+
+The best methods to convert raw audio waveforms into discrete audio tokens or representations suitable for model training.
+
+How to pretrain a model (e.g., a neural codec language model or sequence-to-sequence model) on raw voice data to learn acoustic patterns, grammar, and linguistic meaning by predicting next audio tokens.
+
+How to fine-tune this pretrained model on paired voice input-output data so it can learn to map spoken questions to spoken answers directly.
+
+How the model predicts output audio tokens autoregressively during inference, and how to reconstruct output speech from tokens.
+
+How to verify if the generated speech output is correct, and methods to correct wrong outputs via additional training or fine-tuning.
+
+Suggestions for real-time deployment with low latency, including model optimization techniques such as quantization or streaming generation.
+
+The key functions, libraries, or frameworks useful at each stage.
+
+How to continuously improve the system by collecting feedback and retraining.
+
+Please explain the whole process end-to-end, focusing on direct raw audio input/output, and include practical tips, best practices, and a summary workflow. Avoid involving any intermediate text conversion or speech recognition/transcription steps
