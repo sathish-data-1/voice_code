@@ -1,0 +1,448 @@
+# Project: Speech-to-Speech (Neural-Codec Transformer) — End-to-end
+# Files included below in single document. Save each section as separate files as instructed.
+
+=====================================================================
+README.md
+=====================================================================
+"""
+Speech-to-Speech using discrete audio tokens (Neural-Codec approach)
+
+Overview
+--------
+This project shows a minimal, end-to-end pipeline to train a speech-to-speech model that
+maps input audio to output audio without using intermediate text. It uses:
+ - EnCodec (neural audio codec) to convert waveforms <-> audio tokens
+ - A small autoregressive Transformer to model audio-token sequences
+ - A decoder (EnCodec) to convert predicted tokens back to waveform
+
+This is a research / experimental starting point. Training requires many hours of audio
+and a GPU. Expect to iterate on hyperparameters and architecture.
+
+File structure
+--------------
+speech2speech/
+├─ data/                      # Put your WAV files here (train/val folders)
+├─ preprocess.py              # Preprocessing: resampling, chunking, encodec -> tokens
+├─ dataset.py                 # PyTorch Dataset that yields token sequences
+├─ model.py                   # Transformer model (autoregressive)
+├─ train.py                   # Training loop + checkpointing
+├─ generate.py                # Inference: generate token sequences -> decode -> WAV
+├─ utils.py                   # Helper functions
+├─ requirements.txt           # Python packages
+└─ README.md
+
+Quick start
+-----------
+1. Create a Python venv and install requirements:
+   python -m venv venv
+   source venv/bin/activate
+   pip install -r requirements.txt
+
+2. Put your WAV files in data/train and data/val (16kHz mono recommended).
+
+3. Preprocess to tokens:
+   python preprocess.py --data_dir data --out_dir processed --sr 24000 --frame_duration 0.02
+
+4. Train:
+   python train.py --data processed --epochs 50 --batch_size 8 --device cuda:0
+
+5. Generate (run interactively):
+   python generate.py --checkpoint checkpoints/last.pt --input_wav examples/hi.wav --out_wav out.wav
+
+Notes & caveats
+---------------
+- This is a simplified educational pipeline; production Neuronal-Codec LM systems use
+  multiple codec quantizers, larger models, and additional conditioning.
+- You will need decent GPU (A100/3090 etc.) for meaningful training speed.
+- Data: conversational/transcribed audio helps the model learn mappings.
+"""
+
+=====================================================================
+requirements.txt
+=====================================================================
+"""
+torch>=2.0.0
+torchaudio
+numpy
+soundfile
+encodec  # neural audio codec by Meta (pip install encodec)
+tqdm
+"""
+
+=====================================================================
+utils.py
+=====================================================================
+"""
+Some helper utilities: load/save wav, chunking, seed, simple logging.
+"""
+
+import os
+import random
+import math
+import soundfile as sf
+import numpy as np
+import torch
+
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def load_wav(path, sr=None):
+    wav, orig_sr = sf.read(path)
+    if wav.ndim > 1:
+        wav = wav.mean(axis=1)
+    if sr is None or orig_sr == sr:
+        return wav, orig_sr
+    else:
+        import torchaudio
+        wav_t = torch.from_numpy(wav).unsqueeze(0)
+        wav_resampled = torchaudio.functional.resample(wav_t, orig_sr, sr).squeeze(0).numpy()
+        return wav_resampled, sr
+
+
+def write_wav(path, wav, sr):
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    sf.write(path, wav, samplerate=sr)
+
+=====================================================================
+preprocess.py
+=====================================================================
+"""
+Preprocess script:
+ - Loads WAVs, resamples to target sample rate
+ - Optionally chunks long audio into fixed-duration frames
+ - Encodes frames with EnCodec into discrete tokens
+ - Saves token sequences as .npy files for dataset
+"""
+
+import argparse
+import os
+import glob
+import numpy as np
+from encodec import EncodecModel
+from utils import load_wav, write_wav, set_seed
+
+
+def main(args):
+    set_seed()
+    model = EncodecModel.encodec_model_24khz()  # uses internal config; supports various rates
+    model.set_target_bandwidth(6.0)  # bitrate setting; adjust
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    wav_files = glob.glob(os.path.join(args.data_dir, '**', '*.wav'), recursive=True)
+    print(f'Found {len(wav_files)} files')
+
+    for i, path in enumerate(wav_files):
+        wav, sr = load_wav(path, sr=args.sr)
+        # normalize
+        wav = wav.astype(np.float32)
+        # Chunking into fixed-duration frames (e.g., 1.0s)
+        frame_len = int(args.sr * args.frame_duration)
+        step = frame_len
+        for j in range(0, max(1, len(wav) - frame_len + 1), step):
+            chunk = wav[j:j+frame_len]
+            # Encode with EnCodec -> quantized codes (list of codebooks)
+            with torch.no_grad():
+                wav_t = torch.from_numpy(chunk).unsqueeze(0)
+                encoded = model.encode(wav_t, args.sr)
+                # encoded[0] is a tensor shaped (num_frames, 1, codebook_count)
+                # The encodec package provides .quantized and .codes sometimes; here we'll extract codes
+                # Use model.encode_byte? We'll use encodec's 'encode' returning a dict with 'codes'
+                codes = encoded[0].cpu().numpy()
+            out_file = os.path.join(args.out_dir, f'{os.path.basename(path)}_chunk{j}.npy')
+            np.save(out_file, codes)
+        if i % 50 == 0:
+            print(f'Processed {i}/{len(wav_files)}')
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_dir', type=str, default='data')
+    parser.add_argument('--out_dir', type=str, default='processed')
+    parser.add_argument('--sr', type=int, default=24000)
+    parser.add_argument('--frame_duration', type=float, default=1.0)
+    args = parser.parse_args()
+    main(args)
+
+=====================================================================
+dataset.py
+=====================================================================
+"""
+PyTorch Dataset that loads .npy token sequences produced by preprocess.py
+Each sample is a sequence of integer codes (quantized tokens).
+"""
+
+import os
+import glob
+import numpy as np
+from torch.utils.data import Dataset
+
+
+class AudioTokenDataset(Dataset):
+    def __init__(self, data_dir, seq_len=512):
+        self.files = glob.glob(os.path.join(data_dir, '*.npy'))
+        self.seq_len = seq_len
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        arr = np.load(self.files[idx])
+        # arr shape depends on encodec output; normalize to 1D token stream
+        # Here we assume arr is (frames, codebook_count) with small ints
+        if arr.ndim == 3:
+            # compress codebooks to single stream by interleaving or flattening
+            frames, _, codebooks = arr.shape
+            tokens = arr.reshape(frames * codebooks)
+        else:
+            tokens = arr.ravel()
+        # Convert to int64 for PyTorch
+        if len(tokens) >= self.seq_len:
+            tokens = tokens[:self.seq_len]
+        else:
+            # pad with zeros
+            pad = np.zeros(self.seq_len - len(tokens), dtype=tokens.dtype)
+            tokens = np.concatenate([tokens, pad])
+        return {'tokens': tokens.astype(np.int64)}
+
+=====================================================================
+model.py
+=====================================================================
+"""
+Small autoregressive Transformer to predict next audio token.
+Note: vocabulary size depends on codec (e.g., 1024 per codebook). Here we model tokens as integers
+with vocab_size provided by user. The model uses causal masking for autoregression.
+"""
+
+import torch
+import torch.nn as nn
+import math
+
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=10000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # x: (batch, seq_len, d_model)
+        return x + self.pe[:x.size(1), :]
+
+
+class SmallCausalTransformer(nn.Module):
+    def __init__(self, vocab_size, d_model=512, nhead=8, num_layers=6, dim_ff=2048, max_len=1024):
+        super().__init__()
+        self.token_emb = nn.Embedding(vocab_size, d_model)
+        self.pos_enc = PositionalEncoding(d_model, max_len=max_len)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=dim_ff, activation='gelu')
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.ln_f = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size, bias=False)
+        self.d_model = d_model
+
+    def forward(self, tokens):
+        # tokens: (batch, seq_len)
+        x = self.token_emb(tokens) * math.sqrt(self.d_model)
+        x = self.pos_enc(x)
+        # TransformerEncoder expects (seq_len, batch, d_model) if using PyTorch's default
+        x = x.transpose(0, 1)
+        # Causal mask: prevent attending to future tokens
+        seq_len = x.size(0)
+        mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device) * float('-inf'), diagonal=1)
+        x = self.transformer(x, mask=mask)
+        x = x.transpose(0, 1)
+        x = self.ln_f(x)
+        logits = self.head(x)
+        return logits
+
+=====================================================================
+train.py
+=====================================================================
+"""
+Training loop: loads dataset, model, runs cross-entropy predicting next token.
+Saves checkpoints.
+"""
+
+import argparse
+import os
+import torch
+from torch.utils.data import DataLoader
+import torch.nn.functional as F
+from dataset import AudioTokenDataset
+from model import SmallCausalTransformer
+from utils import set_seed
+
+
+def collate_fn(batch):
+    tokens = torch.stack([torch.from_numpy(b['tokens']) for b in batch], dim=0)
+    return tokens
+
+
+def train(args):
+    set_seed(args.seed)
+    dataset = AudioTokenDataset(args.data, seq_len=args.seq_len)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, collate_fn=collate_fn)
+
+    model = SmallCausalTransformer(vocab_size=args.vocab_size, d_model=args.d_model, nhead=args.nhead, num_layers=args.layers, dim_ff=args.dim_ff, max_len=args.seq_len)
+    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    start_epoch = 0
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+
+    for epoch in range(start_epoch, args.epochs):
+        model.train()
+        total_loss = 0.0
+        for i, tokens in enumerate(dataloader):
+            tokens = tokens.to(device)
+            input_tokens = tokens[:, :-1]
+            target = tokens[:, 1:]
+            logits = model(input_tokens)
+            # logits: (batch, seq_len-1, vocab)
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), target.reshape(-1), ignore_index=0)
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            total_loss += loss.item()
+            if i % 50 == 0:
+                print(f'Epoch {epoch} Iter {i} Loss {loss.item():.4f}')
+        avg = total_loss / (i+1)
+        print(f'Epoch {epoch} Average Loss {avg:.4f}')
+        torch.save({'model_state_dict': model.state_dict(), 'args': vars(args)}, os.path.join(args.checkpoint_dir, f'ckpt_epoch{epoch}.pt'))
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data', type=str, default='processed')
+    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--seq_len', type=int, default=512)
+    parser.add_argument('--vocab_size', type=int, default=8192)
+    parser.add_argument('--d_model', type=int, default=512)
+    parser.add_argument('--nhead', type=int, default=8)
+    parser.add_argument('--layers', type=int, default=6)
+    parser.add_argument('--dim_ff', type=int, default=2048)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--device', type=str, default='cuda:0')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints')
+    parser.add_argument('--seed', type=int, default=42)
+    args = parser.parse_args()
+    train(args)
+
+=====================================================================
+generate.py
+=====================================================================
+"""
+Inference: encode input wav -> seed tokens -> autoregressively sample next tokens -> decode tokens -> wav
+"""
+
+import argparse
+import torch
+import numpy as np
+from encodec import EncodecModel
+from utils import load_wav, write_wav
+from model import SmallCausalTransformer
+
+
+def load_checkpoint(path, device):
+    ckpt = torch.load(path, map_location=device)
+    args = ckpt.get('args', None)
+    model = SmallCausalTransformer(vocab_size=args['vocab_size'], d_model=args['d_model'], nhead=args['nhead'], num_layers=args['layers'], dim_ff=args['dim_ff'], max_len=args['seq_len'])
+    model.load_state_dict(ckpt['model_state_dict'])
+    model.to(device)
+    model.eval()
+    return model, args
+
+
+def top_k_sample(logits, k=50, temperature=1.0):
+    logits = logits / temperature
+    topk = torch.topk(logits, k)
+    vals = topk.values
+    idxs = topk.indices
+    probs = torch.softmax(vals, dim=-1)
+    choice = torch.multinomial(probs, num_samples=1)
+    return idxs.gather(-1, choice).squeeze(-1)
+
+
+def main(args):
+    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    model, model_args = load_checkpoint(args.checkpoint, device)
+    codec = EncodecModel.encodec_model_24khz()
+    codec.set_target_bandwidth(6.0)
+
+    wav, sr = load_wav(args.input_wav, sr=24000)
+    # Encode input to tokens
+    with torch.no_grad():
+        wav_t = torch.from_numpy(wav).unsqueeze(0)
+        encoded = codec.encode(wav_t, 24000)
+        codes = encoded[0].cpu().numpy()
+    # flatten to token stream (same as dataset)
+    if codes.ndim == 3:
+        frames, _, codebooks = codes.shape
+        tokens = codes.reshape(frames * codebooks)
+    else:
+        tokens = codes.ravel()
+    tokens = tokens.astype(np.int64)
+
+    # Autoregressive generation: use tokens as prefix and generate up to max_gen tokens
+    max_gen = args.max_gen
+    seq = list(tokens)
+    for _ in range(max_gen):
+        # prepare input of length seq_len
+        input_seq = seq[-model_args['seq_len']:]
+        if len(input_seq) < model_args['seq_len']:
+            pad = [0] * (model_args['seq_len'] - len(input_seq))
+            input_seq = pad + input_seq
+        input_t = torch.tensor([input_seq], dtype=torch.long, device=device)
+        with torch.no_grad():
+            logits = model(input_t)  # (batch, seq_len, vocab)
+        last_logits = logits[0, -1, :]
+        next_tok = top_k_sample(last_logits, k=args.top_k, temperature=args.temperature).item()
+        seq.append(int(next_tok))
+    seq_arr = np.array(seq, dtype=np.int32)
+    # reshape back to codec frames x codebooks if needed. This is heuristic: depends on preprocess.
+    # Here we assume codebooks known (e.g., 3) and reshape accordingly.
+    codebooks = args.codebooks
+    frames = seq_arr.shape[0] // codebooks
+    seq_arr = seq_arr[:frames * codebooks]
+    codes = seq_arr.reshape(frames, 1, codebooks)
+
+    # decode using encodec
+    import torch
+    codes_t = torch.from_numpy(codes).float()
+    with torch.no_grad():
+        wav_out = codec.decode(codes_t)
+    wav_np = wav_out.squeeze(0).cpu().numpy()
+    write_wav(args.out_wav, wav_np, 24000)
+    print('Wrote', args.out_wav)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--checkpoint', type=str, required=True)
+    parser.add_argument('--input_wav', type=str, required=True)
+    parser.add_argument('--out_wav', type=str, default='out.wav')
+    parser.add_argument('--max_gen', type=int, default=1024)
+    parser.add_argument('--top_k', type=int, default=50)
+    parser.add_argument('--temperature', type=float, default=1.0)
+    parser.add_argument('--device', type=str, default='cuda:0')
+    parser.add_argument('--codebooks', type=int, default=3)
+    args = parser.parse_args()
+    main(args)
+
+=====================================================================
+# End of project files
+=====================================================================
